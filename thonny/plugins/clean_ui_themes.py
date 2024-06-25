@@ -188,9 +188,9 @@ def clean(
         "TButton": {
             "configure": {"background": normal_detail, "foreground": normal_foreground},
             "map": {
-                "foreground": [("disabled", low_foreground), ("alternate", high_foreground)],
-                "background": [("pressed", low_detail), ("active", high_detail)],
-                "bordercolor": [("alternate", high_detail)],
+                "foreground": [("disabled", low_foreground), ("alternate", high_foreground), ("focus", high_foreground), ("!focus", low_foreground)],
+                "background": [("pressed", low_detail), ("active", high_detail), ("focus", high_detail), ("!focus", low_detail)],
+                "bordercolor": [("alternate", low_foreground)],
             },
         },
         "TCheckbutton": {
