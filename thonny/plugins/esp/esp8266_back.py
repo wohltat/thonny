@@ -8,27 +8,22 @@ thonny_container = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirna
 if thonny_container not in sys.path:
     sys.path.insert(0, thonny_container)
 
-import thonny
-from thonny.common import PROCESS_ACK
-from thonny.plugins.micropython.os_mp_backend import SshUnixMicroPythonBackend
+from thonny.plugins.micropython.bare_metal_backend import (
+    BareMetalMicroPythonBackend,
+    launch_bare_metal_backend,
+)
 
-logger = getLogger("thonny.plugins.ev3.ev3_back")
+# Can't use __name__, because it will be "__main__"
+logger = getLogger("thonny.plugins.micropython.esp_backend")
 
 
-class EV3MicroPythonBackend(SshUnixMicroPythonBackend):
+class Esp8266MicroPythonBackend(BareMetalMicroPythonBackend):
     def _get_sys_path_for_analysis(self) -> Optional[List[str]]:
         return [
             self.get_user_stubs_location(),
-            os.path.join(os.path.dirname(__file__), "api_stubs"),
+            os.path.join(os.path.dirname(__file__), "esp_common_api_stubs"),
         ] + super()._get_sys_path_for_analysis()
 
 
 if __name__ == "__main__":
-    thonny.configure_backend_logging()
-    print(PROCESS_ACK)
-
-    import ast
-
-    args = ast.literal_eval(sys.argv[1])
-
-    EV3MicroPythonBackend(args)
+    launch_bare_metal_backend(Esp8266MicroPythonBackend)

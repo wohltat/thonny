@@ -15,6 +15,7 @@ from tkinter import messagebox, ttk
 from tkinter.messagebox import showerror, showwarning
 from typing import Dict, List, Optional, Tuple, Union
 
+import packaging.version
 from packaging.requirements import Requirement
 from packaging.utils import NormalizedName, canonicalize_name, canonicalize_version
 
@@ -35,7 +36,6 @@ from thonny.misc_utils import (
     download_and_parse_json,
     download_bytes,
     get_menu_char,
-    running_on_mac_os,
 )
 from thonny.running import BackendProxy, InlineCommandDialog, get_front_interpreter_for_subprocess
 from thonny.ui_utils import (
@@ -73,6 +73,8 @@ class PipFrame(ttk.Frame, ABC):
 
         self._create_widgets(self)
         self._update_summary()
+
+        self.bind("<<ThemeChanged>>", self._on_theme_changed, True)
 
     def _get_toolbar_frame_style(self) -> Optional[str]:
         return None
@@ -150,14 +152,14 @@ class PipFrame(ttk.Frame, ABC):
         )
         self.button_menu = tk.Menu(self, tearoff=False)
 
-        main_pw = tk.PanedWindow(
+        self.main_pw = tk.PanedWindow(
             parent,
             orient=tk.HORIZONTAL,
             background=lookup_style_option("TextPanedWindow", "background"),
             sashwidth=self.get_large_padding(),
             borderwidth=0,
         )
-        main_pw.grid(
+        self.main_pw.grid(
             row=2,
             column=0,
             sticky="nsew",
@@ -165,7 +167,7 @@ class PipFrame(ttk.Frame, ABC):
         parent.rowconfigure(2, weight=1)
         parent.columnconfigure(0, weight=1)
 
-        listframe = ttk.Frame(main_pw)
+        listframe = ttk.Frame(self.main_pw)
         listframe.rowconfigure(0, weight=1)
         listframe.columnconfigure(0, weight=1)
 
@@ -189,7 +191,7 @@ class PipFrame(ttk.Frame, ABC):
         self.listbox["yscrollcommand"] = list_scrollbar.set
 
         info_text_frame = tktextext.TextFrame(
-            main_pw,
+            self.main_pw,
             read_only=True,
             horizontal_scrollbar=False,
             # background=lookup_style_option("TFrame", "background"),
@@ -252,8 +254,8 @@ class PipFrame(ttk.Frame, ABC):
 
         # self.info_text.tag_configure()
 
-        main_pw.add(listframe)
-        main_pw.add(info_text_frame)
+        self.main_pw.add(listframe)
+        self.main_pw.add(info_text_frame)
 
         self._version_menu = tk.Menu(self.info_text, tearoff=False)
 
@@ -299,10 +301,10 @@ class PipFrame(ttk.Frame, ABC):
     def _update_summary(self):
         if self._get_state() == "inactive":
             text = ""
-        elif self._get_state() == "listing":
-            text = tr("Installed packages") + "..."
         else:
             text = tr("Installed packages")
+            if self._get_state() == "listing":
+                text += "..."
 
         self.summary_label.configure(text=text)
 
@@ -450,13 +452,33 @@ class PipFrame(ttk.Frame, ABC):
         pass
 
     def _get_dist_info(self, name: str, version: str) -> DistInfo:
+        # NB! Runs in a background thread
         installed_dist = self._installed_dists.get(canonicalize_name(name))
         if installed_dist is not None and canonicalize_version(
             installed_dist.version
         ) == canonicalize_version(version):
-            return installed_dist
+            if installed_dist.complete:
+                return installed_dist
+            else:
+                assert installed_dist.meta_dir_path is not None
+                result = self._fetch_complete_installed_dist_info(installed_dist.meta_dir_path)
+                self._installed_dists[canonicalize_name(name)] = result
+                return result
 
-        return download_dist_info_from_pypi(name, version)
+        return self._download_dist_info(name, version)
+
+    def _fetch_complete_installed_dist_info(self, meta_dir_path: str) -> DistInfo:
+        # NB! Runs in a background thread
+        msg = get_runner().send_command_and_wait_in_thread(
+            InlineCommand("get_installed_distribution_metadata", meta_dir_path=meta_dir_path),
+            timeout=8,
+        )
+
+        error = msg.get("error")
+        if error:
+            raise RuntimeError("Could not query package info: " + error)
+
+        return msg["dist_info"]
 
     def _get_version_list(self, name: str) -> List[str]:
         norm_name = canonicalize_name(name)
@@ -528,6 +550,12 @@ class PipFrame(ttk.Frame, ABC):
             )
             self._action_button = action_button_frame.button
             self.info_text.window_create("end", window=action_button_frame)
+        else:
+            logger.debug(
+                "Not creating action button - read only env: %r, read only dist: %r",
+                self._is_read_only_env(),
+                self._is_read_only_dist(name, version),
+            )
 
         self._append_info_text("\n")
 
@@ -548,7 +576,7 @@ class PipFrame(ttk.Frame, ABC):
             if dist_info_future.done() and version_list_future.done():
                 try:
                     info = dist_info_future.result()
-                    versions = version_list_future.result()
+                    version_list_future.result()  # will be cached
                 except Exception as e:
                     logger.exception("Error downloading")
                     self._append_info_text(
@@ -556,13 +584,14 @@ class PipFrame(ttk.Frame, ABC):
                     )
                     self._set_state("idle")
                 else:
-                    self._complete_show_package_info(name, info, versions)
+                    self._complete_show_package_info(info)
             else:
                 get_workbench().after(200, poll_fetch_complete)
 
         poll_fetch_complete()
 
-    def _complete_show_package_info(self, name, dist_info: DistInfo, version_list: List[str]):
+    def _complete_show_package_info(self, dist_info: DistInfo):
+        logger.info("complete_show_package_info %r", dist_info)
         self._set_state("idle")
         assert self._version_button is not None
         self._version_button.configure(state="normal")
@@ -647,7 +676,15 @@ class PipFrame(ttk.Frame, ABC):
         variable = tk.StringVar(self, value=self._current_dist_info.version)
         installed_version_is_in_list = False
 
-        for version in reversed(versions):
+        def parse_version(ver_str):
+            try:
+                ver = packaging.version.Version(ver_str)
+            except packaging.version.InvalidVersion:
+                ver = packaging.version.Version("0.0.1")
+
+            return ver, ver_str
+
+        for version in sorted(versions, key=parse_version, reverse=True):
             if canonicalize_version(version) == installed_version:
                 installed_version_is_in_list = True
 
@@ -709,9 +746,17 @@ class PipFrame(ttk.Frame, ABC):
         if info is None or canonicalize_version(info.version) != canonicalize_version(version):
             return False
 
-        return self._normalize_target_path(info.installed_location) != self._normalize_target_path(
+        if self._normalize_target_path(info.installed_location) != self._normalize_target_path(
             self._get_target_directory()
-        )
+        ):
+            logger.debug(
+                "Read only dist because %r vs %r",
+                info.installed_location,
+                self._get_target_directory(),
+            )
+            return True
+
+        return False
 
     @abstractmethod
     def _normalize_target_path(self, path: str) -> str:
@@ -972,6 +1017,13 @@ class PipFrame(ttk.Frame, ABC):
     def get_small_padding(self):
         return ems_to_pixels(0.6)
 
+    def _on_theme_changed(self, event):
+        self.info_text.configure(
+            background=lookup_style_option("Text", "background"),
+            foreground=lookup_style_option("Text", "foreground"),
+        )
+        self.main_pw.configure(background=lookup_style_option("Text", "background"))
+
 
 class BackendPipFrame(PipFrame):
     def __init__(self, master):
@@ -985,7 +1037,7 @@ class BackendPipFrame(PipFrame):
 
     def _create_widgets(self, parent):
         super()._create_widgets(parent)
-        self.summary_label.grid(padx=(self.get_small_padding(), 0))
+        self.summary_label.grid(padx=(ems_to_pixels(0.4), 0))
         self.menu_button.grid(padx=(0, self.get_small_padding()))
 
     def _get_toolbar_frame_style(self) -> Optional[str]:
@@ -1393,7 +1445,7 @@ class StubsPipFrame(PipFrame):
         return self.proxy_class.backend_description
 
     def _get_target_directory(self):
-        return self.proxy_class.get_stubs_location()
+        return self.proxy_class.get_user_stubs_location()
 
     def _normalize_target_path(self, path: str) -> str:
         return normpath_with_actual_case(path)
@@ -1427,6 +1479,9 @@ class StubsPipFrame(PipFrame):
 
     def _download_dist_info(self, name: str, version: str) -> DistInfo:
         return self.proxy_class.get_package_info_from_index(name, version)
+
+    def _download_version_list(self, name: str) -> List[str]:
+        return self.proxy_class.get_version_list_from_index(name)
 
     def _should_show_search_result_source(self):
         return True

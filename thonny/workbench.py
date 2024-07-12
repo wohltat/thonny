@@ -161,7 +161,7 @@ class Workbench(tk.Tk):
         self._view_records = {}  # type: Dict[str, Dict[str, Any]]
         self.content_inspector_classes = []  # type: List[Type]
         self._latin_shortcuts = {}  # type: Dict[Tuple[int,int], List[Tuple[Callable, Callable]]]
-
+        self._os_dark_mode = os_is_in_dark_mode()
         self._init_language()
 
         self._active_ui_mode = os.environ.get("THONNY_MODE", self.get_option("general.ui_mode"))
@@ -1008,6 +1008,10 @@ class Workbench(tk.Tk):
         self._backend_button.configure(text=desc + "  " + get_menu_char())
 
     def _init_theming(self) -> None:
+        if self.get_option("view.ui_theme") == "Kind of Aqua":
+            # replace pre-Thonny 5 theme with new theme
+            self.set_option("view.ui_theme", "macOS")
+
         self._style = ttk.Style()
         # value is (parent, settings, overrides, images)
         self._ui_themes: Dict[
@@ -1447,7 +1451,7 @@ class Workbench(tk.Tk):
         self._style.theme_use(name)
 
         # https://wiki.tcl.tk/37973#pagetocfe8b22ab
-        for setting in ["background", "foreground", "selectBackground", "selectForeground"]:
+        for setting in ["background", "foreground", "selectbackground", "selectforeground"]:
             value = self._style.lookup("Listbox", setting)
             if value:
                 self.option_add("*TCombobox*Listbox." + setting, value)
@@ -1519,10 +1523,10 @@ class Workbench(tk.Tk):
             return "Windows"
         elif running_on_rpi() and "Raspberry Pi" in available_themes:
             return "Raspberry Pi"
-        elif "Kind of Aqua" in available_themes:
-            return "Kind of Aqua"
+        elif "macOS" in available_themes:
+            return "macOS"
         else:
-            return "Enhanced Clam"
+            return "Tidy Light A"
 
     def get_default_syntax_theme(self) -> str:
         if self.uses_dark_ui_theme():
@@ -2550,6 +2554,11 @@ class Workbench(tk.Tk):
         if self._lost_focus:
             self._lost_focus = False
             self.event_generate("WindowFocusIn")
+            os_dark_mode = os_is_in_dark_mode()
+            if self._os_dark_mode is not os_dark_mode:
+                self._os_dark_mode = os_dark_mode
+                if self.ready:
+                    self.reload_themes()
 
     def _on_focus_out(self, event):
         if self.focus_get() is None:
@@ -2563,6 +2572,9 @@ class Workbench(tk.Tk):
         except Exception:
             # This may give error in Ubuntu
             return None
+
+    def is_closing(self):
+        return self._closing
 
     def destroy(self) -> None:
         try:
@@ -2601,7 +2613,11 @@ class Workbench(tk.Tk):
             logger.exception("Error while destroying workbench")
 
         finally:
-            super().destroy()
+            try:
+                super().destroy()
+            except:
+                logger.exception("Problem during close")
+                sys.exit(1)
 
     def _on_tk_exception(self, exc, val, tb) -> None:
         # copied from tkinter.Tk.report_callback_exception with modifications
@@ -2813,10 +2829,7 @@ class Workbench(tk.Tk):
         return iter(self._load_hooks)
 
     def is_using_aqua_based_theme(self) -> bool:
-        return "aqua" in self._current_theme_name.lower()
-
-    def is_using_tidy_theme(self) -> bool:
-        return "aqua" in self._current_theme_name.lower()
+        return bool(lookup_style_option(".", "aqua_based", False))
 
     def show_notebook_drop_targets(self):
         from thonny.custom_notebook import NotebookTabDropTarget

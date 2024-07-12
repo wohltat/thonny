@@ -1701,6 +1701,10 @@ class BareMetalMicroPythonBackend(MicroPythonBackend, UploadDownloadMixin):
             **kwargs,
         )
 
+    def _get_installed_distribution_metadata_bytes(self, meta_dir_path: str) -> bytes:
+        metadata_path = self._join_remote_path_parts(meta_dir_path, "METADATA")
+        return self._read_file_return_bytes(metadata_path)
+
     def _report_internal_exception(self, msg: str) -> None:
         super()._report_internal_exception(msg)
 
@@ -1717,6 +1721,7 @@ class BareMetalMicroPythonBackend(MicroPythonBackend, UploadDownloadMixin):
 class GenericBareMetalMicroPythonBackend(BareMetalMicroPythonBackend):
     def _get_sys_path_for_analysis(self) -> Optional[List[str]]:
         return [
+            self.get_user_stubs_location(),
             os.path.join(os.path.dirname(__file__), "generic_api_stubs"),
         ] + super()._get_sys_path_for_analysis()
 
@@ -1736,9 +1741,8 @@ def launch_bare_metal_backend(backend_class: Callable[..., BareMetalMicroPythonB
 
     try:
         if args["port"] is None:
-            # remain busy
-            while True:
-                time.sleep(1000)
+            print("\nPort not defined", file=sys.stderr)
+            sys.exit(1)
         elif args["port"] == "webrepl":
             connection = WebReplConnection(args["url"], args["password"])
         else:

@@ -9,10 +9,12 @@ shell becomes kind of title for the execution.
 """
 import collections
 import os.path
+import queue
 import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
 import tkinter as tk
 import traceback
@@ -154,6 +156,9 @@ class Runner:
         self._publishing_events = False
         self._polling_after_id = None
         self._postponed_commands = []  # type: List[CommandToBackend]
+        self._thread_commands = queue.Queue()
+        self._thread_command_results = {}
+        self._running_thread_command_ids = set()
         self._last_accepted_backend_command = None
 
     def start(self) -> None:
@@ -343,6 +348,32 @@ class Runner:
         show_dialog(dlg)
         return dlg.response
 
+    def send_command_and_wait_in_thread(
+        self, cmd: InlineCommand, timeout: int
+    ) -> MessageFromBackend:
+        # should not send directly, as we're in thread
+        cmd_id = cmd.get("id")
+        if cmd_id is None:
+            cmd_id = generate_command_id()
+            cmd["id"] = cmd_id
+
+        start_time = time.time()
+        proxy_at_start = self._proxy
+
+        self._thread_commands.put(cmd)
+
+        while time.time() - start_time < timeout:
+            if self._proxy is not proxy_at_start:
+                raise RuntimeError("Backend restarted")
+            elif cmd_id in self._thread_command_results:
+                result = self._thread_command_results[cmd_id]
+                del self._thread_command_results[cmd_id]
+                return result
+            else:
+                time.sleep(0.1)
+        else:
+            raise TimeoutError(f"Could not receive response to {cmd} in {timeout} seconds")
+
     def _postpone_command(self, cmd: CommandToBackend) -> None:
         # in case of InlineCommands, discard older same type command
         if isinstance(cmd, InlineCommand):
@@ -361,6 +392,12 @@ class Runner:
 
         for cmd in todo:
             # logger.debug("Sending postponed command: %s", cmd) # too much spam
+            self.send_command(cmd)
+
+    def _send_thread_commands(self) -> None:
+        while not self._thread_commands.empty():
+            cmd = self._thread_commands.get()
+            self._running_thread_command_ids.add(cmd["id"])
             self.send_command(cmd)
 
     def send_program_input(self, data: str) -> None:
@@ -671,6 +708,7 @@ class Runner:
 
                 msg_count += 1
             except BackendTerminatedError as exc:
+                logger.info("Backend terminated with code: %r", exc.returncode)
                 self._handle_backend_termination(exc.returncode)
                 return False
 
@@ -685,22 +723,30 @@ class Runner:
             else:
                 "other messages don't affect the state"
 
-            # Publish the event
-            # NB! This may cause another command to be sent before we get to postponed commands.
-            try:
-                self._publishing_events = True
-                class_event_type = type(msg).__name__
-                get_workbench().event_generate(class_event_type, event=msg)  # more general event
-                if msg.event_type != class_event_type:
-                    # more specific event
-                    get_workbench().event_generate(msg.event_type, event=msg)
-            finally:
-                self._publishing_events = False
+            command_id = msg.get("command_id")
+            if command_id in self._running_thread_command_ids:
+                self._running_thread_command_ids.remove(command_id)
+                self._thread_command_results[command_id] = msg
+            else:
+                # Publish the event
+                # NB! This may cause another command to be sent before we get to postponed commands
+                try:
+                    self._publishing_events = True
+                    class_event_type = type(msg).__name__
+                    get_workbench().event_generate(
+                        class_event_type, event=msg
+                    )  # more general event
+                    if msg.event_type != class_event_type:
+                        # more specific event
+                        get_workbench().event_generate(msg.event_type, event=msg)
+                finally:
+                    self._publishing_events = False
 
             # TODO: is it necessary???
             # https://stackoverflow.com/a/13520271/261181
             # get_workbench().update()
 
+        self._send_thread_commands()
         self._send_postponed_commands()
 
     def _handle_backend_termination(self, returncode: int) -> None:
@@ -729,6 +775,9 @@ class Runner:
 
     def restart_backend(self, clean: bool, first: bool = False, automatic: bool = False) -> None:
         """Recreate (or replace) backend proxy / backend process."""
+        logger.info(
+            "Restarting back-end, clean: %r, first: %r, automatic: %r", clean, first, automatic
+        )
         was_running = self.is_running()
         self.destroy_backend()
         self._last_accepted_backend_command = None
@@ -741,9 +790,8 @@ class Runner:
         backend_class = get_workbench().get_backends()[backend_name].proxy_class
         self._set_state("running")
         self._proxy = None
+        logger.info("Starting backend %r", backend_class)
         self._proxy = backend_class(clean)
-
-        self._poll_backend_messages()
 
         if not first:
             get_shell().restart(automatic=automatic, was_running=was_running)
@@ -751,7 +799,11 @@ class Runner:
 
         get_workbench().event_generate("BackendRestart", full=True)
 
+        self._poll_backend_messages()
+
     def destroy_backend(self, for_restart: bool = False) -> None:
+        logger.info("Destroying backend")
+
         if self._polling_after_id is not None:
             get_workbench().after_cancel(self._polling_after_id)
             self._polling_after_id = None
@@ -1019,7 +1071,8 @@ class BackendProxy(ABC):
 
         return download_dist_info_from_pypi(name, version)
 
-    def get_version_list_from_index(self, name: str) -> List[str]:
+    @classmethod
+    def get_version_list_from_index(cls, name: str) -> List[str]:
         from thonny.plugins.pip_gui import try_download_version_list_from_pypi
 
         return try_download_version_list_from_pypi(name)
@@ -1028,7 +1081,7 @@ class BackendProxy(ABC):
         return tr("Search on PyPI")
 
     @classmethod
-    def get_stubs_location(cls):
+    def get_user_stubs_location(cls):
         return os.path.join(thonny.get_thonny_user_dir(), "stubs", cls.backend_name)
 
 
@@ -1123,6 +1176,7 @@ class SubprocessProxy(BackendProxy, ABC):
 
     def _start_background_process(self, clean=None, extra_args=[]):
         # deque, because in one occasion I need to put messages back
+        logger.info("Starting background process, clean: %r, extra_args: %r", clean, extra_args)
         self._response_queue = collections.deque()
 
         if not os.path.exists(self._mgmt_executable):
@@ -1632,12 +1686,14 @@ def construct_cd_command(path) -> str:
 
 
 _command_id_counter = 0
+_command_id_counter_lock = threading.Lock()
 
 
 def generate_command_id():
     global _command_id_counter
-    _command_id_counter += 1
-    return "cmd_" + str(_command_id_counter)
+    with _command_id_counter_lock:
+        _command_id_counter += 1
+        return "cmd_" + str(_command_id_counter)
 
 
 class InlineCommandDialog(WorkDialog):

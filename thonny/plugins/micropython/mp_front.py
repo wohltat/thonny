@@ -4,7 +4,6 @@ import shutil
 import sys
 import time
 from logging import getLogger
-from textwrap import dedent
 from tkinter import messagebox, ttk
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -43,9 +42,7 @@ WEBREPL_PORT_VALUE = "webrepl"
 VIDS_PIDS_TO_AVOID_IN_GENERIC_BACKEND = set()
 
 MICROPYTHON_LIB_INDEX_URL = "https://micropython.org/pi/v2/index.json"
-MICROPYTHON_LIB_METADATA_URL = (
-    "https://raw.githubusercontent.com/thonny/thonny/master/data/micropython-lib-metadata.json"
-)
+MICROPYTHON_LIB_METADATA_URL = "https://raw.githubusercontent.com/aivarannamaa/pipkin/master/data/micropython-lib-extra-metadata.json"
 _mp_lib_index_cache = None
 _mp_lib_metadata_cache = None
 
@@ -272,9 +269,10 @@ class MicroPythonProxy(SubprocessProxy):
 
         return super().get_package_info_from_index(name, version)
 
-    def get_version_list_from_index(self, name: str) -> List[str]:
+    @classmethod
+    def get_version_list_from_index(cls, name: str) -> List[str]:
         # Try mp.org first
-        index_data = self._get_micropython_lib_index_data()
+        index_data = cls._get_micropython_lib_index_data()
 
         for package in index_data["packages"]:
             if canonicalize_name(package["name"]) == canonicalize_name(name):
@@ -287,17 +285,19 @@ class MicroPythonProxy(SubprocessProxy):
 
     @classmethod
     def _augment_dist_info(cls, dist_info: DistInfo) -> DistInfo:
-        metadata = cls._get_micropython_lib_metadata()
         norm_name = canonicalize_name(dist_info.name)
-        home_page = dist_info.home_page
-        summary = dist_info.summary
+        extra_metadata = cls._get_micropython_lib_metadata().get(norm_name, {})
 
-        if (home_page is None or summary is None) and norm_name in metadata:
-            if home_page is None:
-                home_page = metadata[norm_name].get("project_url")
-            if summary is None:
-                summary = metadata[norm_name].get("description")
-            return dataclasses.replace(dist_info, summary=summary, home_page=home_page)
+        if dist_info.home_page is None and "home_page" in extra_metadata:
+            dist_info = dataclasses.replace(dist_info, home_page=extra_metadata["home_page"])
+
+        if dist_info.summary is None and "description" in extra_metadata:
+            dist_info = dataclasses.replace(dist_info, summary=extra_metadata["description"])
+
+        project_urls = dict(dist_info.project_urls) or {}
+        if "source_url" in extra_metadata:
+            project_urls["Source"] = extra_metadata["source_url"]
+            dist_info = dataclasses.replace(dist_info, project_urls=project_urls)
 
         return dist_info
 
@@ -305,8 +305,10 @@ class MicroPythonProxy(SubprocessProxy):
 class BareMetalMicroPythonProxy(MicroPythonProxy):
     def __init__(self, clean):
         self._port = get_workbench().get_option(self.backend_name + ".port")
+        if self._port == "auto":
+            # may come from pre-Thonny 5 configuration file
+            self._port = None
         self._clean_start = clean
-        self._fix_port()
 
         super().__init__(clean)
 
@@ -319,33 +321,12 @@ class BareMetalMicroPythonProxy(MicroPythonProxy):
             # let the OS release the port
             time.sleep(0.1)
 
-    def _fix_port(self):
-        if self._port == WEBREPL_PORT_VALUE:
-            return
-
-        elif self._port == "auto":
-            potential = self._detect_potential_ports()
-            if len(potential) == 1:
-                self._port = potential[0][0]
-            else:
-                self._port = None
-                message = dedent(
-                    """\
-                    Couldn't find the device automatically. 
-                    Check the connection (making sure the device is not in bootloader mode) or choose
-                    "Configure interpreter" in the interpreter menu (bottom-right corner of the window)
-                    to select specific port or another interpreter."""
-                )
-
-                if len(potential) > 1:
-                    _, descriptions = zip(*potential)
-                    message += "\n\nLikely candidates are:\n * " + "\n * ".join(descriptions)
-
-                self._show_error(message)
-
     def _start_background_process(self, clean=None, extra_args=[]):
-        if self._port is None:
-            return
+        logger.info(
+            "Starting background process (BareMetal), clean: %r, extra_args: %r", clean, extra_args
+        )
+        # if self._port is None:
+        #    return
 
         # refresh the ports cache, so that the next uncached request (in BackendRestart handler)
         # is less likely to race with the back-end process trying to open a port and getting a
@@ -366,6 +347,7 @@ class BareMetalMicroPythonProxy(MicroPythonProxy):
                 self.backend_name + ".interrupt_on_connect"
             ),
             "proxy_class": self.__class__.__name__,
+            "user_stubs_location": self.get_user_stubs_location(),
         }
         if self._port == WEBREPL_PORT_VALUE:
             args["url"] = get_workbench().get_option(self.backend_name + ".webrepl_url")
@@ -557,7 +539,6 @@ class BareMetalMicroPythonProxy(MicroPythonProxy):
         return bool(configuration.get(f"{self.backend_name}.webrepl_url", False))
 
     def get_current_switcher_configuration(self) -> Dict[str, Any]:
-        # NB! using current port value, not the configured one (which may be "auto")
         conf = {
             "run.backend_name": self.backend_name,
             f"{self.backend_name}.port": self._port,
@@ -572,7 +553,9 @@ class BareMetalMicroPythonProxy(MicroPythonProxy):
     @classmethod
     def get_switcher_configuration_label(cls, conf: Dict[str, Any]) -> str:
         port = conf[f"{cls.backend_name}.port"]
-        if port == WEBREPL_PORT_VALUE:
+        if port is None:
+            return f"{cls.backend_description}  •  <no port>"
+        elif port == WEBREPL_PORT_VALUE:
             url = conf[f"{cls.backend_name}.webrepl_url"]
             return f"{cls.backend_description}  •  {url}"
         else:
@@ -591,11 +574,12 @@ class BareMetalMicroPythonProxy(MicroPythonProxy):
     def get_switcher_entries(cls):
         def should_show(conf):
             port = conf[f"{cls.backend_name}.port"]
+            if port == "auto":
+                # may come from pre-Thonny 5 conf
+                port = None
+
             if port == WEBREPL_PORT_VALUE:
                 return True
-            elif port == "auto":
-                potential_ports = cls._detect_potential_ports()
-                return len(potential_ports) > 0
             else:
                 for p in list_serial_ports():
                     if p.device == port:
@@ -938,7 +922,6 @@ class BareMetalMicroPythonConfigPage(TabbedBackendDetailsConfigurationPage):
         ports = list_serial_ports(max_cache_age=0, skip_logging=True)
         self._ports_by_desc = {get_serial_port_label(p): p for p in ports}
         self._port_names_by_desc = {get_serial_port_label(p): p.device for p in ports}
-        self._port_names_by_desc["< " + tr("Try to detect port automatically") + " >"] = "auto"
 
         if self.allow_webrepl:
             self._port_names_by_desc[WEBREPL_OPTION_DESC] = WEBREPL_PORT_VALUE
@@ -1209,6 +1192,7 @@ class LocalMicroPythonProxy(MicroPythonProxy):
                 {
                     "interpreter": self._target_executable,
                     "cwd": self.get_cwd(),
+                    "user_stubs_location": self.get_user_stubs_location(),
                 }
             ),
         ]
@@ -1333,6 +1317,7 @@ class SshMicroPythonProxy(MicroPythonProxy):
             "interpreter": self._target_executable,
             "host": self._host,
             "user": self._user,
+            "user_stubs_location": self.get_user_stubs_location(),
         }
 
         args.update(self._get_time_args())
